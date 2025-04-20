@@ -2,7 +2,12 @@
 
 An interactive dashboard for visualizing stock market data with real-time data from Yahoo Finance.
 
-![Dashboard Preview](https://via.placeholder.com/800x400?text=Stock+Dashboard+Preview)
+The dashboard features multiple interactive charts including:
+- Stock price charts (line and candlestick)
+- Volume analysis
+- Performance comparison
+- Analyst recommendations
+- Company information and financial data
 
 ## Features
 
