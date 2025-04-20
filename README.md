@@ -17,7 +17,7 @@ An interactive dashboard for visualizing stock market data with real-time data f
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/stock-dashboard.git
+git clone https://github.com/milkbread-data/stock-dashboard.git
 cd stock-dashboard
 
 # Install dependencies
@@ -63,4 +63,4 @@ MIT
 
 ## Author
 
-Your Name
+milkread
