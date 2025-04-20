@@ -986,4 +986,4 @@ def add_custom_ticker(n_clicks, ticker_input, current_options, current_values, a
 if __name__ == '__main__':
     # Get port from environment variable or use default
     port = int(os.environ.get('PORT', 8050))
-    app.run_server(debug=True, host='0.0.0.0', port=port)
+    app.run(debug=True, host='0.0.0.0', port=port)
