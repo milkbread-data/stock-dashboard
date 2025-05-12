@@ -57,10 +57,28 @@ All stock data is fetched from Yahoo Finance using the `yfinance` library.
 
 ## Deployment
 
-This app can be deployed to platforms like Heroku, AWS, or Google Cloud. For Heroku deployment, make sure to:
+### Deploying to Render (Recommended)
 
-1. Add a `Procfile` with: `web: gunicorn app:server`
-2. Add `server = app.server` to your app.py file
+This app is optimized for deployment on Render's free tier:
+
+1. Create a Render account at [render.com](https://render.com)
+2. Connect your GitHub repository
+3. Create a new Web Service and select this repository
+4. Render will automatically detect the configuration from `render.yaml`
+5. Click "Create Web Service"
+
+Alternatively, you can manually configure:
+- **Environment**: Python
+- **Build Command**: `pip install -r requirements.txt`
+- **Start Command**: `gunicorn app:server`
+- **Plan**: Free
+
+### Other Deployment Options
+
+The app can also be deployed to platforms like Heroku, AWS, or Google Cloud:
+
+1. Make sure the `Procfile` contains: `web: gunicorn app:server`
+2. Verify `server = app.server` is in your app.py file
 
 ## License
 

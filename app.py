@@ -10,13 +10,15 @@ from datetime import datetime, timedelta
 import openpyxl  # Required for Excel export
 import yfinance as yf
 import os  # For environment variables
+from functools import lru_cache  # For caching
+import time  # For cache expiration
 
 # Define stock tickers to download
 stock_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'JPM', 'V', 'WMT']
 
-# Download stock data for the past 2 years
+# Download stock data for a shorter period initially to speed up startup
 end_date = datetime.now()
-start_date = end_date - timedelta(days=730)  # 2 years of data
+start_date = end_date - timedelta(days=90)  # Start with 90 days of data for faster loading
 
 # Download data
 print("Downloading stock data...")
@@ -25,7 +27,8 @@ stock_data = yf.download(
     start=start_date,
     end=end_date,
     group_by='ticker',
-    auto_adjust=True
+    auto_adjust=True,
+    progress=False  # Disable progress bar for cleaner logs
 )
 
 # Process the data into a format suitable for our dashboard
@@ -54,44 +57,41 @@ for ticker in stock_tickers:
 # Combine all tickers into one dataframe
 df = pd.concat(df_list, ignore_index=True)
 
-# Get analyst recommendations and other information for each ticker
-print("Getting analyst data...")
-analyst_data = {}
-for ticker in stock_tickers:
+# Add caching to reduce API calls
+# Cache for 1 hour (3600 seconds)
+@lru_cache(maxsize=32)
+def get_ticker_data(ticker, timestamp):
+    """Get data for a ticker with caching. The timestamp parameter is used to invalidate the cache periodically."""
+    print(f"Fetching fresh data for {ticker}")
     try:
-        # Create Ticker object
         stock = yf.Ticker(ticker)
         
-        # Get analyst recommendations - handle potential format issues
+        # Get analyst recommendations
         try:
             recommendations = stock.recommendations
             if recommendations is not None and not recommendations.empty:
-                # Check if 'Date' is in index or columns
                 if isinstance(recommendations.index, pd.DatetimeIndex):
                     recommendations = recommendations.reset_index()
                 
-                # Sort by date if available
                 if 'Date' in recommendations.columns:
                     recommendations = recommendations.sort_values('Date', ascending=False).head(10)
         except Exception as rec_error:
             print(f"Error processing recommendations for {ticker}: {rec_error}")
             recommendations = None
         
-        # Get current price from historical data if not in info
-        current_price = None
+        # Get current price
         try:
-            # Try to get from info
             current_price = stock.info.get('currentPrice', None)
             
-            # If not available, use the most recent close price
             if current_price is None and not df.empty:
                 ticker_df = df[df['Ticker'] == ticker].sort_values('date', ascending=False)
                 if not ticker_df.empty:
                     current_price = ticker_df.iloc[0]['close']
         except Exception as price_error:
             print(f"Error getting current price for {ticker}: {price_error}")
+            current_price = None
         
-        # Get other data with error handling
+        # Get other data
         try:
             target_price = stock.info.get('targetMeanPrice', None)
             recommendation_mean = stock.info.get('recommendationMean', None)
@@ -104,22 +104,16 @@ for ticker in stock_tickers:
             recommendation_key = 'N/A'
             business_summary = None
         
-        # Get income statement data instead of deprecated earnings
+        # Get income statement data
         try:
             income_stmt = stock.income_stmt
-            # Create a simplified earnings dataframe from income statement
             if income_stmt is not None and not income_stmt.empty:
-                # Extract Net Income and EPS data
                 net_income = income_stmt.loc['Net Income']
-                # Try to get EPS if available
                 try:
                     eps = income_stmt.loc['Basic EPS']
                 except:
-                    # If EPS not available, calculate a simple version from net income
-                    # This is just an approximation
                     eps = None
                 
-                # Create a dataframe with the data
                 earnings_data = {
                     'Year': net_income.index.year,
                     'Net Income': net_income.values,
@@ -132,8 +126,7 @@ for ticker in stock_tickers:
             print(f"Error getting income statement for {ticker}: {earnings_error}")
             earnings = None
         
-        # Store all data
-        analyst_data[ticker] = {
+        return {
             'recommendations': recommendations,
             'target_price': target_price,
             'current_price': current_price,
@@ -144,7 +137,7 @@ for ticker in stock_tickers:
         }
     except Exception as e:
         print(f"Error getting analyst data for {ticker}: {e}")
-        analyst_data[ticker] = {
+        return {
             'recommendations': None,
             'target_price': None,
             'current_price': None,
@@ -153,6 +146,19 @@ for ticker in stock_tickers:
             'business_summary': None,
             'earnings': None
         }
+
+# Get cache timestamp (refreshes every hour)
+def get_cache_timestamp():
+    """Return a timestamp that changes every hour to refresh the cache"""
+    return int(time.time() / 3600)  # Changes every hour
+
+# Get analyst recommendations and other information for each ticker
+print("Getting analyst data...")
+analyst_data = {}
+current_timestamp = get_cache_timestamp()
+
+for ticker in stock_tickers:
+    analyst_data[ticker] = get_ticker_data(ticker, current_timestamp)
 
 # Initialize the Dash app with Bootstrap theme and Font Awesome
 app = dash.Dash(__name__, 
@@ -838,9 +844,9 @@ def add_custom_ticker(n_clicks, ticker_input, current_options, current_values, a
         
         # Add the new ticker to global data
         try:
-            # Download data for the new ticker
+            # Download data for the new ticker - use 90 days for faster loading
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=730)  # 2 years of data
+            start_date = end_date - timedelta(days=90)  # 90 days of data for faster loading
             
             print(f"Downloading data for {ticker_input}...")
             new_data = yf.download(
@@ -941,17 +947,10 @@ def add_custom_ticker(n_clicks, ticker_input, current_options, current_values, a
                         print(f"Error getting income statement for {ticker_input}: {earnings_error}")
                         earnings = None
                     
-                    # Store all data
+                    # Use our cached function to get analyst data
                     global analyst_data
-                    analyst_data[ticker_input] = {
-                        'recommendations': recommendations,
-                        'target_price': target_price,
-                        'current_price': current_price,
-                        'recommendation_mean': recommendation_mean,
-                        'recommendation_key': recommendation_key,
-                        'business_summary': business_summary,
-                        'earnings': earnings
-                    }
+                    current_timestamp = get_cache_timestamp()
+                    analyst_data[ticker_input] = get_ticker_data(ticker_input, current_timestamp)
                 except Exception as e:
                     print(f"Error getting analyst data for {ticker_input}: {e}")
                     analyst_data[ticker_input] = {
@@ -982,8 +981,20 @@ def add_custom_ticker(n_clicks, ticker_input, current_options, current_values, a
         print(f"Error validating ticker {ticker_input}: {e}")
         return current_options, current_values, html.Div(f"Invalid ticker symbol: {str(e)}", className="text-danger"), analyst_options
 
+# Memory cleanup function
+def cleanup_memory():
+    """Clean up memory by clearing cache periodically"""
+    import gc
+    gc.collect()
+    print("Memory cleanup performed")
+
 # Run the app
 if __name__ == '__main__':
     # Get port from environment variable or use default
     port = int(os.environ.get('PORT', 8050))
-    app.run(debug=True, host='0.0.0.0', port=port)
+    
+    # Set debug to False for production deployment on Render
+    debug = os.environ.get('DASH_DEBUG', 'False').lower() == 'true'
+    
+    # Run the app
+    app.run(debug=debug, host='0.0.0.0', port=port)
