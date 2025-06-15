@@ -47,13 +47,14 @@ All stock data is fetched from Yahoo Finance using the `yfinance` library.
 
 ## Dependencies
 
-- dash
-- dash-bootstrap-components
-- pandas
-- plotly
-- numpy
-- yfinance
-- openpyxl
+- dash==3.0.4
+- dash-bootstrap-components==2.0.3
+- pandas==2.3.0
+- plotly==6.1.2
+- numpy==2.3.0
+- yfinance==0.2.63
+- openpyxl==3.1.5
+- gunicorn==23.0.0
 
 ## Deployment
 
