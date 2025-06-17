@@ -3,11 +3,27 @@ services:
   - type: web
     name: stock-dashboard
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:server
-    plan: free
+    region: oregon  # Choose a region closest to your users
+    buildCommand: |
+      pip install --upgrade pip &&
+      pip install -r requirements.txt
+    startCommand: gunicorn app:server --workers=4 --timeout=120
+    plan: free  # Upgrade to paid plans for production use
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.0
       - key: DASH_DEBUG
         value: false
+      - key: PYTHONUNBUFFERED
+        value: true
+      - key: GUNICORN_WORKERS
+        value: 4
+      - key: GUNICORN_TIMEOUT
+        value: "120"
+      - key: PORT
+        value: "10000"  # Default port for Render
+    autoDeploy: true  # Automatically deploy on push to main branch
+    healthCheckPath: /_dash-health-check
+    envVarReferences:
+      - group: python
+        key: pythonVersion

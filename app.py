@@ -10,59 +10,120 @@ from datetime import datetime, timedelta
 import openpyxl  # Required for Excel export
 import yfinance as yf
 import os  # For environment variables
+import re  # For input validation
+import threading  # For thread safety
 from functools import lru_cache  # For caching
 import time  # For cache expiration
+import logging
+from werkzeug.middleware.proxy_fix import ProxyFix
+from flask import Flask, request, abort, jsonify
+from flask_talisman import Talisman
+from collections import defaultdict # Added import
+import secrets
 
-# Define stock tickers to download
-stock_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'JPM', 'V', 'WMT']
+# Configure logging early
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Validate ticker symbol format
+def is_valid_ticker(ticker_symbol):
+    """
+    Validate that the ticker symbol is safe and follows expected format.
+    Rules:
+    - 1-10 characters long
+    - Only alphanumeric and dots allowed
+    - Must start with a letter
+    - No consecutive dots
+    - Not in blocklist (e.g., system, internal names)
+    """
+    if not ticker_symbol or not isinstance(ticker_symbol, str):
+        return False
+        
+    ticker = ticker_symbol.upper().strip()
+    
+    # Blocklist of restricted tickers
+    BLOCKLIST = {'SYSTEM', 'ADMIN', 'ROOT', 'CON', 'PRN', 'AUX', 'NUL', 'COM1', 'LPT1'}
+    
+    if ticker in BLOCKLIST:
+        return False
+        
+    # Basic format validation
+    if not re.match(r'^[A-Z][A-Z0-9.]{0,9}$', ticker):
+        return False
+        
+    # No consecutive dots
+    if '..' in ticker:
+        return False
+        
+    return True
+
+DEFAULT_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'JPM', 'V', 'WMT']
+stock_tickers = [ticker for ticker in DEFAULT_TICKERS if is_valid_ticker(ticker)]
 
 # Download stock data for a shorter period initially to speed up startup
 end_date = datetime.now()
 start_date = end_date - timedelta(days=90)  # Start with 90 days of data for faster loading
 
-# Download data
-print("Downloading stock data...")
-stock_data = yf.download(
-    tickers=stock_tickers,
-    start=start_date,
-    end=end_date,
-    group_by='ticker',
-    auto_adjust=True,
-    progress=False  # Disable progress bar for cleaner logs
-)
+# Download data with error handling and rate limiting
+logger.info("Downloading initial stock data...")
+try:
+    stock_data = yf.download(
+        tickers=stock_tickers,
+        start=start_date,
+        end=end_date,
+        group_by='ticker',
+        auto_adjust=True,
+        progress=False,  # Disable progress bar for cleaner logs
+        threads=True  # Use threads for parallel downloads
+    )
+except Exception as e:
+    logger.error(f"Error downloading stock data: {str(e)}")
+    stock_data = pd.DataFrame()  # Return empty DataFrame on error
 
 # Process the data into a format suitable for our dashboard
 df_list = []
+if not stock_data.empty:
+    # Check if stock_data.columns is a MultiIndex, which happens with group_by='ticker'
+    is_multi_index = isinstance(stock_data.columns, pd.MultiIndex)
+    
+    for ticker in stock_tickers:
+        try:
+            if is_multi_index:
+                if ticker in stock_data.columns.levels[0]:
+                    ticker_data = stock_data[ticker].copy()
+                else:
+                    logger.warning(f"Ticker {ticker} not found in downloaded multi-index stock_data columns during initial load.")
+                    continue
+            else: # Single ticker download or no group_by
+                ticker_data = stock_data.copy() # Assuming stock_data is for this single ticker if not multi-index
+                if 'Ticker' not in ticker_data.columns: # Add Ticker column if it's a single stock download
+                    ticker_data['Ticker'] = ticker
 
-for ticker in stock_tickers:
-    # Extract data for this ticker
-    ticker_data = stock_data[ticker].copy()
-    ticker_data.reset_index(inplace=True)
-    
-    # Add ticker column
-    ticker_data['Ticker'] = ticker
-    
-    # Rename columns
-    ticker_data.rename(columns={
-        'Date': 'date',
-        'Open': 'open',
-        'High': 'high',
-        'Low': 'low',
-        'Close': 'close',
-        'Volume': 'volume'
-    }, inplace=True)
-    
-    df_list.append(ticker_data)
+            if ticker_data.empty:
+                logger.warning(f"No data returned for ticker {ticker} in initial download.")
+                continue
+            
+            ticker_data.reset_index(inplace=True)
+            ticker_data['Ticker'] = ticker # Ensure Ticker column is present and correct
+            ticker_data.rename(columns={
+                'Date': 'date', 'Open': 'open', 'High': 'high',
+                'Low': 'low', 'Close': 'close', 'Volume': 'volume'
+            }, inplace=True)
+            df_list.append(ticker_data)
+        except Exception as e:
+            logger.error(f"Error processing initial data for ticker {ticker}: {e}")
 
-# Combine all tickers into one dataframe
-df = pd.concat(df_list, ignore_index=True)
+if df_list:
+    df = pd.concat(df_list, ignore_index=True)
+else:
+    df = pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close', 'volume', 'Ticker'])
 
 # Add caching to reduce API calls
 # Cache for 1 hour (3600 seconds)
 @lru_cache(maxsize=32)
 def get_ticker_data(ticker, timestamp):
     """Get data for a ticker with caching. The timestamp parameter is used to invalidate the cache periodically."""
-    print(f"Fetching fresh data for {ticker}")
+    logger.info(f"Fetching fresh analyst data for {ticker}")
     try:
         stock = yf.Ticker(ticker)
         
@@ -76,19 +137,19 @@ def get_ticker_data(ticker, timestamp):
                 if 'Date' in recommendations.columns:
                     recommendations = recommendations.sort_values('Date', ascending=False).head(10)
         except Exception as rec_error:
-            print(f"Error processing recommendations for {ticker}: {rec_error}")
+            logger.error(f"Error processing recommendations for {ticker}: {rec_error}")
             recommendations = None
         
         # Get current price
         try:
             current_price = stock.info.get('currentPrice', None)
             
-            if current_price is None and not df.empty:
+            if current_price is None and 'df' in globals() and not df.empty: # Check if df is defined
                 ticker_df = df[df['Ticker'] == ticker].sort_values('date', ascending=False)
                 if not ticker_df.empty:
                     current_price = ticker_df.iloc[0]['close']
         except Exception as price_error:
-            print(f"Error getting current price for {ticker}: {price_error}")
+            logger.error(f"Error getting current price for {ticker}: {price_error}")
             current_price = None
         
         # Get other data
@@ -97,12 +158,16 @@ def get_ticker_data(ticker, timestamp):
             recommendation_mean = stock.info.get('recommendationMean', None)
             recommendation_key = stock.info.get('recommendationKey', 'N/A')
             business_summary = stock.info.get('longBusinessSummary', None)
+            trailing_pe = stock.info.get('trailingPE', None)
+            dividend_yield = stock.info.get('dividendYield', None)
         except Exception as info_error:
-            print(f"Error getting info data for {ticker}: {info_error}")
+            logger.error(f"Error getting info data for {ticker}: {info_error}")
             target_price = None
             recommendation_mean = None
             recommendation_key = 'N/A'
             business_summary = None
+            trailing_pe = None
+            dividend_yield = None
         
         # Get income statement data
         try:
@@ -111,7 +176,7 @@ def get_ticker_data(ticker, timestamp):
                 net_income = income_stmt.loc['Net Income']
                 try:
                     eps = income_stmt.loc['Basic EPS']
-                except:
+                except KeyError:
                     eps = None
                 
                 earnings_data = {
@@ -123,20 +188,22 @@ def get_ticker_data(ticker, timestamp):
             else:
                 earnings = None
         except Exception as earnings_error:
-            print(f"Error getting income statement for {ticker}: {earnings_error}")
+            logger.error(f"Error getting income statement for {ticker}: {earnings_error}")
             earnings = None
         
         return {
             'recommendations': recommendations,
-            'target_price': target_price,
+            'target_price': target_price, # Ensure this is handled if None
             'current_price': current_price,
             'recommendation_mean': recommendation_mean,
             'recommendation_key': recommendation_key,
             'business_summary': business_summary,
-            'earnings': earnings
+            'earnings': earnings,
+            'trailing_pe': trailing_pe,
+            'dividend_yield': dividend_yield
         }
     except Exception as e:
-        print(f"Error getting analyst data for {ticker}: {e}")
+        logger.error(f"Error getting analyst data for {ticker}: {e}")
         return {
             'recommendations': None,
             'target_price': None,
@@ -144,7 +211,9 @@ def get_ticker_data(ticker, timestamp):
             'recommendation_mean': None,
             'recommendation_key': 'N/A',
             'business_summary': None,
-            'earnings': None
+            'earnings': None,
+            'trailing_pe': None,
+            'dividend_yield': None
         }
 
 # Get cache timestamp (refreshes every hour)
@@ -153,23 +222,59 @@ def get_cache_timestamp():
     return int(time.time() / 3600)  # Changes every hour
 
 # Get analyst recommendations and other information for each ticker
-print("Getting analyst data...")
+logger.info("Getting initial analyst data...")
 analyst_data = {}
 current_timestamp = get_cache_timestamp()
 
 for ticker in stock_tickers:
     analyst_data[ticker] = get_ticker_data(ticker, current_timestamp)
 
-# Initialize the Dash app with Bootstrap theme and Font Awesome
-app = dash.Dash(__name__, 
-                external_stylesheets=[
-                    dbc.themes.BOOTSTRAP,
-                    'https://use.fontawesome.com/releases/v5.15.4/css/all.css'
-                ],
-                meta_tags=[{'name': 'viewport', 'content': 'width=device-width, initial-scale=1'}])
+# Initialize the Flask server
+server = Flask(__name__)
 
-# Add server variable for deployment platforms like Heroku
-server = app.server
+# Security headers and middleware
+server.wsgi_app = ProxyFix(server.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+# Initialize the Dash app with security configurations
+app = dash.Dash(
+    __name__,
+    server=server,
+    external_stylesheets=[
+        dbc.themes.BOOTSTRAP,
+        'https://use.fontawesome.com/releases/v5.15.4/css/all.css'
+    ],
+    meta_tags=[
+        {'name': 'viewport', 'content': 'width=device-width, initial-scale=1'}
+    ]
+)
+
+# Security headers
+app.server.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=30).total_seconds(),
+    SECRET_KEY=os.environ.get('FLASK_SECRET_KEY', secrets.token_hex(32))
+)
+
+# Apply Talisman security headers
+Talisman(
+    app.server,
+    force_https=True,
+    strict_transport_security=True,
+    session_cookie_secure=True,
+    frame_options='SAMEORIGIN',  # To align with custom headers if kept, or rely on this
+    x_content_type_options=True,  # Corrected: Sets X-Content-Type-Options: nosniff
+    x_xss_protection=True,        # Corrected: Sets X-XSS-Protection: 1; mode=block
+    content_security_policy={
+        'default-src': "'self'",
+        'script-src': ["'self'", "'unsafe-inline'", "'unsafe-eval'"],  # 'unsafe-eval' often needed for Dash
+        'style-src': ["'self'", "'unsafe-inline'", "https://use.fontawesome.com", "https://cdn.jsdelivr.net"],
+        'font-src': ["'self'", "https://use.fontawesome.com", "https://cdn.jsdelivr.net"],
+        'img-src': ["'self'", "data:", "https:"],
+        'connect-src': ["'self'", "https://query1.finance.yahoo.com"],
+    }
+)
 
 # App layout
 app.layout = dbc.Container([
@@ -185,19 +290,38 @@ app.layout = dbc.Container([
             dbc.Card([
                 dbc.CardHeader("Filters"),
                 dbc.CardBody([
-                    html.P("Select Date Range:"),
+                    html.P("Select Timeframe:"),
+                    dcc.RadioItems(
+                        id='timeframe-selector',
+                        options=[
+                            {'label': '1M', 'value': '1M'},
+                            {'label': '3M', 'value': '3M'}, # Default, matches initial 90-day load
+                            {'label': '6M', 'value': '6M'},
+                            {'label': 'YTD', 'value': 'YTD'},
+                            {'label': '1Y', 'value': '1Y'},
+                            {'label': '5Y', 'value': '5Y'},
+                            {'label': 'All', 'value': 'ALL'},
+                        ],
+                        value='3M', # Default to 3 months
+                        labelStyle={'display': 'inline-block', 'margin-right': '10px'},
+                        className="mb-3"
+                    ),
+                    html.P("Or Select Custom Date Range:"),
                     dcc.DatePickerRange(
                         id='date-picker-range',
-                        start_date=df['date'].min(),
-                        end_date=df['date'].max(),
+                        min_date_allowed=df['date'].min() if not df.empty else datetime.now().date() - timedelta(days=365*10),
+                        max_date_allowed=df['date'].max() if not df.empty else datetime.now().date(),
+                        initial_visible_month=df['date'].max() if not df.empty else datetime.now().date(),
+                        start_date=df['date'].min() if not df.empty else datetime.now().date() - timedelta(days=90),
+                        end_date=df['date'].max() if not df.empty else datetime.now().date(),
                         display_format='YYYY-MM-DD'
                     ),
                     html.Div(style={"height": "20px"}),
                     html.P("Select Stocks:"),
                     dcc.Dropdown(
                         id='ticker-dropdown',
-                        options=[{'label': ticker, 'value': ticker} for ticker in stock_tickers],
-                        value=stock_tickers[:5],  # Default to first 5 stocks
+                        options=[{'label': ticker, 'value': ticker} for ticker in sorted(stock_tickers)],
+                        value=stock_tickers[:5] if len(stock_tickers) >= 5 else stock_tickers,  # Default to first 5 stocks or all if less than 5
                         multi=True
                     ),
                     html.Div(style={"height": "20px"}),
@@ -332,6 +456,48 @@ def calculate_performance(filtered_df, tickers):
     else:
         return pd.DataFrame()
 
+# Callback to update DatePickerRange based on timeframe selector
+@app.callback(
+    [Output('date-picker-range', 'start_date'),
+     Output('date-picker-range', 'end_date')],
+    [Input('timeframe-selector', 'value')],
+    prevent_initial_call=True # Avoids firing on initial load if defaults are already set
+)
+def update_date_picker_from_timeframe(selected_timeframe):
+    if df.empty:
+        # Fallback dates if df is empty, charts will be empty anyway
+        # These should match the fallback in the layout for consistency
+        fallback_end_date = datetime.now().date()
+        fallback_start_date = fallback_end_date - timedelta(days=90)
+        return fallback_start_date, fallback_end_date
+
+    # Use df.date.max() as the reference end_date for calculations
+    # Ensure we are using date objects for comparison if df['date'] are datetimes
+    max_data_date = pd.to_datetime(df['date'].max()).date()
+    min_data_date = pd.to_datetime(df['date'].min()).date()
+
+    new_end_date = max_data_date
+    
+    if selected_timeframe == '1M':
+        new_start_date = max_data_date - timedelta(days=30)
+    elif selected_timeframe == '3M':
+        new_start_date = max_data_date - timedelta(days=90)
+    elif selected_timeframe == '6M':
+        new_start_date = max_data_date - timedelta(days=180)
+    elif selected_timeframe == 'YTD':
+        new_start_date = datetime(max_data_date.year, 1, 1).date()
+    elif selected_timeframe == '1Y':
+        new_start_date = max_data_date - timedelta(days=365)
+    elif selected_timeframe == '5Y':
+        new_start_date = max_data_date - timedelta(days=5*365)
+    elif selected_timeframe == 'ALL':
+        new_start_date = min_data_date
+    else: # Default or unrecognized
+        new_start_date = min_data_date
+
+    # Ensure calculated start_date is not before the actual min_data_date and not after end_date
+    return max(new_start_date, min_data_date), new_end_date
+
 # Callbacks
 @app.callback(
     [Output('price-graph', 'figure'),
@@ -393,6 +559,11 @@ def prepare_export_data(start_date, end_date, tickers):
     # Filter data based on current selections
     filtered_df = filter_dataframe(start_date, end_date, tickers)
     
+    # Handle cases where no data is found for the selection
+    if filtered_df.empty:
+        # Return an empty DataFrame with expected columns for consistency
+        return pd.DataFrame(columns=['date', 'Ticker', 'open', 'high', 'low', 'close', 'volume', 'daily_change', 'daily_range'])
+
     # Create a copy of the dataframe for export
     export_df = filtered_df.copy()
     
@@ -490,7 +661,7 @@ def update_analyst_data(ticker):
     
     # Price Target
     if ticker_data['target_price'] and ticker_data['current_price']:
-        target_price = ticker_data['target_price']
+        target_price = float(ticker_data['target_price']) # Ensure it's a float
         current_price = ticker_data['current_price']
         upside = ((target_price - current_price) / current_price) * 100
         
@@ -529,6 +700,38 @@ def update_analyst_data(ticker):
             ], className="mb-4")
         ]))
     
+    # Key Metrics (P/E, Dividend Yield)
+    key_metrics_cards = []
+    if ticker_data.get('trailing_pe') is not None:
+        key_metrics_cards.append(
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H4(f"{ticker_data['trailing_pe']:.2f}", className="card-title"),
+                        html.P("Trailing P/E Ratio", className="card-text text-muted")
+                    ])
+                ], className="text-center")
+            ], width=6, md=3)
+        )
+    if ticker_data.get('dividend_yield') is not None:
+        key_metrics_cards.append(
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H4(f"{ticker_data['dividend_yield']*100:.2f}%", className="card-title"),
+                        html.P("Dividend Yield", className="card-text text-muted")
+                    ])
+                ], className="text-center")
+            ], width=6, md=3)
+        )
+    
+    if key_metrics_cards:
+        analyst_section.append(html.Div([
+            html.H5("Key Metrics"),
+            dbc.Row(key_metrics_cards, className="mb-4")
+        ]))
+
+
     # Analyst Rating
     if ticker_data['recommendation_mean'] and ticker_data['recommendation_key']:
         rec_mean = ticker_data['recommendation_mean']
@@ -644,7 +847,7 @@ def update_analyst_data(ticker):
                     )
                 ]))
         except Exception as e:
-            print(f"Error processing recommendations table for {ticker}: {e}")
+            logger.error(f"Error processing recommendations table for {ticker}: {e}")
             analyst_section.append(html.Div([
                 html.H5("Recent Analyst Actions"),
                 html.P(f"Error processing recommendations data: {str(e)}")
@@ -797,204 +1000,316 @@ def update_analyst_data(ticker):
             ]))
             
         except Exception as e:
-            print(f"Error processing earnings data for {ticker}: {e}")
+            logger.error(f"Error processing earnings data for {ticker}: {e}")
             earnings_section = [html.P(f"Error processing earnings data: {str(e)}")]
     else:
         earnings_section = [html.P("No earnings data available for this stock.")]
     
     return analyst_section, company_section, earnings_section
 
-# Callback for adding custom ticker
+# Rate limiting configuration
+# from datetime import datetime, timedelta # Already imported
+from functools import wraps
+import time
+
+# Rate limiting configuration
+RATE_LIMIT = 10  # Max requests
+RATE_WINDOW = 60  # Per X seconds
+
+# Thread-safe rate limiter using a class
+class RateLimiter:
+    def __init__(self):
+        self.requests = defaultdict(list)
+        self.lock = threading.Lock()
+    
+    def is_rate_limited(self, key, limit=RATE_LIMIT, window=RATE_WINDOW):
+        with self.lock:
+            current_time = time.time()
+            # Remove old entries
+            self.requests[key] = [t for t in self.requests[key] 
+                               if current_time - t < window]
+            
+            if len(self.requests[key]) >= limit:
+                return True
+                
+            self.requests[key].append(current_time)
+            return False
+
+# Initialize rate limiter
+rate_limiter = RateLimiter()
+
+def rate_limit(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        ip = request.remote_addr or '127.0.0.1'
+        if rate_limiter.is_rate_limited(f'ip_{ip}'):
+            return jsonify({
+                'error': 'Too many requests',
+                'status': 429
+            }), 429
+        return f(*args, **kwargs)
+    return decorated_function
+
+# Callback for adding custom ticker with input validation and rate limiting
 @app.callback(
     [Output('ticker-dropdown', 'options'),
      Output('ticker-dropdown', 'value'),
-     Output('ticker-feedback', 'children'),
-     Output('analyst-ticker-dropdown', 'options')],
+     Output('custom-ticker-input', 'value'), # Corrected ID
+     Output('ticker-feedback', 'children'),      # Corrected ID
+     Output('analyst-ticker-dropdown', 'options')], # Add output for analyst dropdown
     [Input('add-ticker-button', 'n_clicks')],
-    [State('custom-ticker-input', 'value'),
+    [State('custom-ticker-input', 'value'), # Corrected ID
      State('ticker-dropdown', 'options'),
      State('ticker-dropdown', 'value'),
-     State('analyst-ticker-dropdown', 'options')],
+     State('analyst-ticker-dropdown', 'options')], # State for analyst dropdown options
     prevent_initial_call=True
 )
+@rate_limit
 def add_custom_ticker(n_clicks, ticker_input, current_options, current_values, analyst_options):
-    if not ticker_input:
-        return current_options, current_values, html.Div("Please enter a ticker symbol", className="text-danger"), analyst_options
+    """
+    Add a custom ticker to the dashboard with security checks.
     
-    # Convert to uppercase
-    ticker_input = ticker_input.strip().upper()
+    Args:
+        n_clicks: Number of button clicks
+        ticker_input: User-provided ticker symbol
+        current_options: Current dropdown options
+        current_values: Currently selected values
+        analyst_options: Current analyst dropdown options
+        
+    Returns:
+        Tuple: Updated options, values, and alert message
+    """
+    # Input validation
+    if not ticker_input or not isinstance(ticker_input, str):
+        return (
+            dash.no_update, 
+            dash.no_update, 
+            "", 
+            dbc.Alert("Invalid ticker symbol", color="danger", dismissable=True, duration=4000),
+            dash.no_update
+        )
     
-    # Check if ticker already exists in options
-    if any(opt['value'] == ticker_input for opt in current_options):
-        # If ticker exists but not selected, add it to selected values
-        if ticker_input not in current_values:
-            current_values.append(ticker_input)
-        return current_options, current_values, html.Div(f"Ticker {ticker_input} already exists and is now selected", className="text-info"), analyst_options
+    ticker = ticker_input.strip().upper()
     
-    # Try to validate the ticker by fetching data
+    # Log the attempt
+    logger.info(f"Ticker addition attempt: {ticker} from IP: {request.remote_addr}")
+    
+    # Check rate limit for this specific ticker to prevent abuse
+    if rate_limiter.is_rate_limited(f'ticker_{ticker}', limit=3, window=3600):  # 3 attempts per hour per ticker
+        logger.warning(f"Rate limit exceeded for ticker: {ticker}")
+        return (
+            dash.no_update,
+            dash.no_update,
+            "",
+            dbc.Alert("Please wait before adding this ticker again.", 
+                     color="warning", 
+                     dismissable=True, 
+                     duration=4000),
+            dash.no_update
+        )
+    
+    if n_clicks is None or not ticker_input:
+        return current_options, current_values, "", dash.no_update, analyst_options
+    
+    # Validate ticker format and security
+    if not is_valid_ticker(ticker):
+        logger.warning(f"Invalid ticker format: {ticker}")
+        return (
+            dash.no_update,
+            dash.no_update,
+            "",
+            dbc.Alert("Invalid ticker symbol format. Please use 1-10 alphanumeric characters.", 
+                     color="danger", 
+                     dismissable=True, 
+                     duration=4000),
+            dash.no_update
+        )
+    
+    # Check if ticker is already in the list (case-insensitive)
+    existing_tickers = {opt['value'].upper() for opt in current_options}
+    if ticker in existing_tickers: # ticker is already .upper()
+        logger.info(f"Ticker already exists: {ticker}")
+        return (
+            current_options,
+            current_values if ticker in current_values else (current_values + [ticker] if current_values else [ticker]),
+            "",
+            dbc.Alert(f"{ticker} is already in your watchlist.", 
+                     color="info", 
+                     dismissable=True, 
+                     duration=4000),
+            analyst_options # Return the analyst_options as well
+        )
+    
     try:
-        # Check if ticker exists in Yahoo Finance
-        ticker_info = yf.Ticker(ticker_input)
+        # Try to fetch data for the ticker to verify it exists
+        test_data = yf.Ticker(ticker)
+        if test_data.history(period='1d').empty: # More reliable check for tradable stock
+            # Optionally, could check test_data.info for more details if history is empty
+            raise ValueError(f"Invalid ticker or no historical data available for {ticker}")
+            
+        # Update global variables. Use with caution in multi-process environments.
+        global stock_tickers, analyst_data, df
         
-        # Try to get some basic info to validate
-        history = ticker_info.history(period="1mo")
+        if ticker not in stock_tickers:
+            stock_tickers.append(ticker)
+
+        # Fetch and cache analyst data for the new ticker
+        current_ts = get_cache_timestamp()
+        analyst_data[ticker] = get_ticker_data(ticker, current_ts)
+        logger.info(f"Fetched analyst data for new ticker: {ticker}")
+
+        # Fetch historical data for the new ticker and add to the global df
+        # Determine date range - e.g., match existing df or a default like 5 years
+        # Use a sensible default if df is empty or only has very recent data
+        history_start_date = datetime.now() - timedelta(days=5*365)
+        if not df.empty and not pd.isna(df['date'].min()):
+             history_start_date = min(history_start_date, pd.to_datetime(df['date'].min()))
         
-        if history.empty:
-            return current_options, current_values, html.Div(f"Ticker {ticker_input} not found or has no data", className="text-danger"), analyst_options
-        
-        # Add the new ticker to global data
-        try:
-            # Download data for the new ticker - use 90 days for faster loading
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=90)  # 90 days of data for faster loading
+        new_ticker_end_date = datetime.now()
+
+        logger.info(f"Fetching historical data for new ticker {ticker} from {history_start_date.strftime('%Y-%m-%d')} to {new_ticker_end_date.strftime('%Y-%m-%d')}")
+        new_data_raw = yf.download(
+            tickers=[ticker],
+            start=history_start_date,
+            end=new_ticker_end_date,
+            auto_adjust=True,
+            progress=False
+        )
+
+        if not new_data_raw.empty and isinstance(new_data_raw.index, pd.DatetimeIndex):
+            new_data_processed = new_data_raw.copy()
+            new_data_processed.reset_index(inplace=True)
+            new_data_processed['Ticker'] = ticker
+            new_data_processed.rename(columns={
+                'Date': 'date', 'Open': 'open', 'High': 'high',
+                'Low': 'low', 'Close': 'close', 'Volume': 'volume'
+            }, inplace=True)
             
-            print(f"Downloading data for {ticker_input}...")
-            new_data = yf.download(
-                tickers=ticker_input,
-                start=start_date,
-                end=end_date,
-                progress=False
-            )
-            
-            if not new_data.empty:
-                # Process the data
-                new_data.reset_index(inplace=True)
-                new_data['Ticker'] = ticker_input
-                
-                # Rename columns
-                new_data.rename(columns={
-                    'Date': 'date',
-                    'Open': 'open',
-                    'High': 'high',
-                    'Low': 'low',
-                    'Close': 'close',
-                    'Volume': 'volume'
-                }, inplace=True)
-                
-                # Add to global dataframe
-                global df
-                df = pd.concat([df, new_data], ignore_index=True)
-                
-                # Get analyst data for the new ticker
-                try:
-                    # Create Ticker object
-                    stock = yf.Ticker(ticker_input)
-                    
-                    # Get analyst recommendations - handle potential format issues
-                    try:
-                        recommendations = stock.recommendations
-                        if recommendations is not None and not recommendations.empty:
-                            # Check if 'Date' is in index or columns
-                            if isinstance(recommendations.index, pd.DatetimeIndex):
-                                recommendations = recommendations.reset_index()
-                            
-                            # Sort by date if available
-                            if 'Date' in recommendations.columns:
-                                recommendations = recommendations.sort_values('Date', ascending=False).head(10)
-                    except Exception as rec_error:
-                        print(f"Error processing recommendations for {ticker_input}: {rec_error}")
-                        recommendations = None
-                    
-                    # Get current price from historical data if not in info
-                    current_price = None
-                    try:
-                        # Try to get from info
-                        current_price = stock.info.get('currentPrice', None)
-                        
-                        # If not available, use the most recent close price
-                        if current_price is None and not new_data.empty:
-                            current_price = new_data.iloc[-1]['close']
-                    except Exception as price_error:
-                        print(f"Error getting current price for {ticker_input}: {price_error}")
-                    
-                    # Get other data with error handling
-                    try:
-                        target_price = stock.info.get('targetMeanPrice', None)
-                        recommendation_mean = stock.info.get('recommendationMean', None)
-                        recommendation_key = stock.info.get('recommendationKey', 'N/A')
-                        business_summary = stock.info.get('longBusinessSummary', None)
-                    except Exception as info_error:
-                        print(f"Error getting info data for {ticker_input}: {info_error}")
-                        target_price = None
-                        recommendation_mean = None
-                        recommendation_key = 'N/A'
-                        business_summary = None
-                    
-                    # Get income statement data
-                    try:
-                        income_stmt = stock.income_stmt
-                        # Create a simplified earnings dataframe from income statement
-                        if income_stmt is not None and not income_stmt.empty:
-                            # Extract Net Income and EPS data
-                            net_income = income_stmt.loc['Net Income']
-                            # Try to get EPS if available
-                            try:
-                                eps = income_stmt.loc['Basic EPS']
-                            except:
-                                # If EPS not available, calculate a simple version from net income
-                                eps = None
-                            
-                            # Create a dataframe with the data
-                            earnings_data = {
-                                'Year': net_income.index.year,
-                                'Net Income': net_income.values,
-                                'EPS': eps.values if eps is not None else None
-                            }
-                            earnings = pd.DataFrame(earnings_data)
-                        else:
-                            earnings = None
-                    except Exception as earnings_error:
-                        print(f"Error getting income statement for {ticker_input}: {earnings_error}")
-                        earnings = None
-                    
-                    # Use our cached function to get analyst data
-                    global analyst_data
-                    current_timestamp = get_cache_timestamp()
-                    analyst_data[ticker_input] = get_ticker_data(ticker_input, current_timestamp)
-                except Exception as e:
-                    print(f"Error getting analyst data for {ticker_input}: {e}")
-                    analyst_data[ticker_input] = {
-                        'recommendations': None,
-                        'target_price': None,
-                        'current_price': None,
-                        'recommendation_mean': None,
-                        'recommendation_key': 'N/A',
-                        'business_summary': None,
-                        'earnings': None
-                    }
-            
-            # Add to options and selected values
-            new_options = current_options + [{'label': ticker_input, 'value': ticker_input}]
-            new_values = current_values + [ticker_input]
-            new_analyst_options = analyst_options + [{'label': ticker_input, 'value': ticker_input}]
-            
-            return new_options, new_values, html.Div([
-                html.Span("Success! ", className="text-success fw-bold"),
-                f"Added {ticker_input} successfully!"
-            ]), new_analyst_options
-            
-        except Exception as e:
-            print(f"Error adding ticker data for {ticker_input}: {e}")
-            return current_options, current_values, html.Div(f"Error adding ticker data: {str(e)}", className="text-danger"), analyst_options
+            expected_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'Ticker']
+            new_data_processed = new_data_processed[[col for col in expected_cols if col in new_data_processed.columns]]
+            df = pd.concat([df, new_data_processed], ignore_index=True).drop_duplicates(subset=['date', 'Ticker'], keep='last')
+            logger.info(f"Successfully added/updated historical data for {ticker} in the main DataFrame.")
+        else:
+            logger.warning(f"No historical data found or data format error for {ticker} when trying to add to main DataFrame.")
+
+        # Note: Historical data for the main 'df' is not dynamically added here.
+        # This would require appending to the global 'df' and potentially re-filtering.
+        # For now, graphs might not show the new ticker until a full app data reload.
+
+        # Add new ticker to the dropdown options
+        new_options = current_options + [{'label': ticker, 'value': ticker}]
+        # Add the new ticker to the selected values
+        new_values = current_values + [ticker] if current_values else [ticker]
+
+        # Update options for the analyst ticker dropdown
+        new_analyst_dropdown_options = analyst_options + [{'label': ticker, 'value': ticker}]
+
+        alert = dbc.Alert(
+            f"Successfully added {ticker} to the dashboard.",
+            color="success",
+            dismissable=True,
+            duration=4000
+        )
+        # Clear input, return new options for both dropdowns, and the alert
+        return new_options, new_values, "", alert, new_analyst_dropdown_options
         
     except Exception as e:
-        print(f"Error validating ticker {ticker_input}: {e}")
-        return current_options, current_values, html.Div(f"Invalid ticker symbol: {str(e)}", className="text-danger"), analyst_options
+        logger.error(f"Error adding ticker {ticker}: {str(e)}")
+        alert = dbc.Alert(
+            f"Failed to add {ticker}. Please check the ticker symbol and try again.",
+            color="danger",
+            dismissable=True,
+            duration=4000
+        )
+        return dash.no_update, dash.no_update, "", alert, dash.no_update
 
-# Memory cleanup function
-def cleanup_memory():
-    """Clean up memory by clearing cache periodically"""
-    import gc
-    gc.collect()
-    print("Memory cleanup performed")
+# Security middleware to set headers
+# Note: Talisman handles many of these. This can be for additional headers or if Talisman config is minimal.
+@app.server.after_request
+def add_security_headers(response):
+    # Talisman sets X-Content-Type-Options, X-Frame-Options (via frame_options), X-XSS-Protection.
+    # If not fully relying on Talisman for these, they can be set here.
+    # response.headers['X-Content-Type-Options'] = 'nosniff'
+    # response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    # response.headers['X-XSS-Protection'] = '1; mode=block'
+    
+    # The Cache-Control header below is very restrictive and will prevent caching of static assets.
+    # This can impact performance. Consider applying this more selectively.
+    # Talisman and Dash defaults are usually better for static assets.
+    # if 'Cache-Control' not in response.headers:
+    #     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
+    return response
+
+# Error handlers
+@app.server.errorhandler(404)
+def not_found_error(error):
+    return "404 - Page not found", 404
+
+@app.server.errorhandler(500)
+def internal_error(error):
+    logger.error(f"Server error: {error}")
+    return "500 - Internal server error", 500
 
 # Run the app
 if __name__ == '__main__':
-    # Get port from environment variable or use default
+    # Get configuration from environment variables
     port = int(os.environ.get('PORT', 8050))
+    debug = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
     
-    # Set debug to False for production deployment on Render
-    debug = os.environ.get('DASH_DEBUG', 'False').lower() == 'true'
+    # Never run with debug=True in production
+    if not debug:
+        import logging
+        from logging.handlers import RotatingFileHandler
+        
+        # Configure logging to file
+        file_handler = RotatingFileHandler('stock_dashboard.log', maxBytes=10240, backupCount=10)
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'))
+        file_handler.setLevel(logging.INFO)
+        app.server.logger.addHandler(file_handler)
+        app.server.logger.setLevel(logging.INFO)
+        app.server.logger.info('Stock Dashboard startup')
     
-    # Run the app
-    app.run(debug=debug, host='0.0.0.0', port=port)
+    # Run the app with detailed logging
+    logger.info("\n" + "="*50)
+    logger.info("Starting Stock Market Dashboard")
+    logger.info("="*50)
+
+    # Try port 8051 to avoid potential conflicts
+    alt_port = 8051
+    
+    def run_server(host, port, use_ssl=False):
+        print(f"\nAttempting to start server on {'https' if use_ssl else 'http'}://{host}:{port}")
+        try:
+            app.run(
+                # WARNING: ssl_context='adhoc' is for development only and is insecure.
+                # Do NOT use 'adhoc' in a production environment.
+                # Production SSL should be handled by a reverse proxy (Nginx, Apache) or load balancer.
+                # Talisman's force_https=True assumes secure termination upstream or at the proxy.
+                host=host,
+                port=port,
+                debug=debug,
+                use_reloader=False,
+                ssl_context='adhoc' if use_ssl else None
+            )
+            return True
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            return False
+    
+    # Try different configurations in sequence
+    configs = [
+        ("127.0.0.1", port, False),    # Standard HTTP on default port
+        ("127.0.0.1", alt_port, False), # HTTP on alternative port
+        ("0.0.0.0", port, False),      # HTTP on all interfaces
+        ("0.0.0.0", alt_port, False)    # HTTP on all interfaces, alternative port
+    ]
+    
+    for host, p, ssl in configs:
+        print(f"\nTrying configuration: host={host}, port={p}, ssl={ssl}")
+        if run_server(host, p, ssl):
+            break
+    else:
+        print("\nFailed to start server with any configuration")
+        print("Please check if another application is using the port or if there are firewall issues")
+    
