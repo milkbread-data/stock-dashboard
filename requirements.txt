@@ -1,8 +1,32 @@
+# Production Dependencies
+# ====================
+# Core Dependencies
 dash==3.0.4
 dash-bootstrap-components==2.0.3
 pandas==2.3.0
 plotly==6.1.2
 numpy==2.3.0
 yfinance==0.2.63
-openpyxl==3.1.5
+
+# Web Server
 gunicorn==23.0.0
+Werkzeug==3.0.3
+Flask==3.0.2
+Flask-Compress==1.14
+
+# Security
+Flask-Talisman==1.1.0
+python-dotenv==1.0.1
+itsdangerous==2.2.0
+cryptography==42.0.5
+
+# Data Processing
+openpyxl==3.1.5
+pandas-datareader==0.10.0
+html5lib==1.1
+
+# Performance
+psutil==5.9.8
+python-memcached==1.59  # Optional: For caching
+
+# Install with: pip install -r requirements.txt
